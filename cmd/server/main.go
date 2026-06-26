@@ -9,8 +9,12 @@ import (
 )
 
 func main() {
+	// The Hub runs in its own goroutine and owns all matchmaking.
+	hub := network.NewHub()
+	go hub.Run()
+
 	// /ws is where a client "upgrades" from plain HTTP to a WebSocket.
-	http.HandleFunc("/ws", network.ServeWS)
+	http.HandleFunc("/ws", hub.ServeWS)
 
 	// A trivial health endpoint. Render (Phase 5) pings this to know we're alive.
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

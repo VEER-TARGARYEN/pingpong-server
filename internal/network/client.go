@@ -1,6 +1,7 @@
 package network
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
@@ -20,47 +21,29 @@ const (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	// Dev-only: accept connections from any origin. We'll restrict this in Phase 5.
+	// Dev-only: accept connections from any origin. We'll restrict this in Phase 5B.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 // Client represents one connected player at the network layer.
 type Client struct {
-	conn *websocket.Conn // the underlying socket
-	send chan []byte     // outbound queue: the game loop writes here, writePump drains it
-}
-
-// ServeWS handles a client's request to open a WebSocket.
-func ServeWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		// Upgrade already wrote an HTTP error response on failure.
-		log.Printf("upgrade error: %v", err)
-		return
-	}
-
-	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 256), // buffered: absorb bursts without blocking the game loop
-	}
-
-	// Two goroutines per client: exactly one reader, exactly one writer.
-	go client.writePump()
-	go client.readPump()
-
-	log.Printf("client connected: %s", conn.RemoteAddr())
+	conn   *websocket.Conn // the underlying socket
+	send   chan []byte     // outbound queue: the room/hub writes here, writePump drains it
+	hub    *Hub            // back-reference so readPump can forward messages
+	player int             // 1 or 2, assigned by the Hub when matched
+	code   string          // the room code this client created (if any)
 }
 
 // readPump is the ONLY goroutine that reads from this connection.
 func (c *Client) readPump() {
 	defer func() {
-		c.conn.Close() // closing here unblocks writePump's next write, which then also exits
+		c.hub.unregister <- c // tell the Hub we're gone (cleanup / room teardown)
+		c.conn.Close()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
-		// Each pong from the client extends our deadline — proof it's alive.
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
@@ -72,16 +55,32 @@ func (c *Client) readPump() {
 				websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("read error: %v", err)
 			}
-			break // any error (incl. timeout / clean close) ends the loop -> defer closes conn
+			break
 		}
-		log.Printf("received from %s: %s", c.conn.RemoteAddr(), message)
-		// Phase 4 hook: this is where an input message becomes a game command.
+
+		var m clientMsg
+		if err := json.Unmarshal(message, &m); err != nil {
+			continue // ignore malformed messages rather than dropping the connection
+		}
+
+		// Route by message type. create/join go to matchmaking; input goes to
+		// the Hub, which forwards it to the room that owns this client.
+		switch m.T {
+		case "create":
+			c.hub.create <- c
+		case "join":
+			c.hub.join <- joinReq{client: c, code: m.Code}
+		case "input":
+			c.hub.inputs <- inputMsg{client: c, dir: m.Dir}
+		case "vote":
+			c.hub.votes <- voteMsg{client: c, points: m.Points}
+		}
 	}
 }
 
 // writePump is the ONLY goroutine that writes to this connection.
 func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod) // fires every ~54s to send a ping
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
@@ -92,16 +91,15 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// The send channel was closed (e.g. hub kicked us). Say goodbye cleanly.
+				// The send channel was closed (room tore us down). Say goodbye.
 				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				return // write failed -> connection is dead -> exit (defer closes it)
+				return
 			}
 
 		case <-ticker.C:
-			// Heartbeat: send a ping. If the client is gone, this write fails and we bail.
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return

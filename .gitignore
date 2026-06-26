@@ -1,4 +1,5 @@
 # Go
+/cmd/wsclient/   # throwaway dev test client, not part of the project
 /bin/
 *.exe
 *.test
