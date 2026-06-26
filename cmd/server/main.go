@@ -22,6 +22,17 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// Friendly landing page so the bare URL isn't a confusing 404. "/" matches
+	// every unrouted path, so 404 anything that isn't exactly the root.
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("NEON PONG server is running. Clients connect via /ws"))
+	})
+
 	// Render injects the port via $PORT. Locally we fall back to 8080.
 	port := os.Getenv("PORT")
 	if port == "" {
