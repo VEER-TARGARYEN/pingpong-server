@@ -1,0 +1,11 @@
+# Render Blueprint: deploy the Go server as a Docker web service.
+# In Render: New + -> Blueprint -> connect this repo. Or create a Web Service
+# manually and point it at the Dockerfile.
+services:
+  - type: web
+    name: pingpong-server
+    runtime: docker
+    plan: free            # free tier spins down when idle (~30s cold start)
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz   # Render pings this to know the service is live
+    autoDeploy: true            # redeploy on every push to the connected branch
