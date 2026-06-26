@@ -29,18 +29,21 @@ type voteMsg struct {
 type Hub struct {
 	create     chan *Client
 	join       chan joinReq
+	quick      chan *Client
 	inputs     chan inputMsg
 	votes      chan voteMsg
 	unregister chan *Client
 
-	pending map[string]*Client // room code -> the lone creator waiting for an opponent
-	rooms   map[*Client]*Room  // client -> the active room it belongs to
+	pending      map[string]*Client // room code -> the lone creator waiting for an opponent
+	quickWaiting *Client            // a lone player in the random-match queue
+	rooms        map[*Client]*Room  // client -> the active room it belongs to
 }
 
 func NewHub() *Hub {
 	return &Hub{
 		create:     make(chan *Client),
 		join:       make(chan joinReq),
+		quick:      make(chan *Client),
 		inputs:     make(chan inputMsg, 64),
 		votes:      make(chan voteMsg, 16),
 		unregister: make(chan *Client),
@@ -70,17 +73,19 @@ func (h *Hub) Run() {
 				break
 			}
 			delete(h.pending, req.code)
-
-			p1, p2 := creator, req.client
-			p1.player, p2.player = 1, 2
-			room := newRoom(p1, p2)
-			h.rooms[p1] = room
-			h.rooms[p2] = room
-
-			pushJSON(p1, startMsg{T: "start", You: 1})
-			pushJSON(p2, startMsg{T: "start", You: 2})
-			go room.run()
+			h.startMatch(creator, req.client)
 			log.Printf("room %s started", req.code)
+
+		case c := <-h.quick:
+			if h.quickWaiting == nil || h.quickWaiting == c {
+				h.quickWaiting = c
+				log.Printf("%s queued for quick match", c.conn.RemoteAddr())
+			} else {
+				p1 := h.quickWaiting
+				h.quickWaiting = nil
+				h.startMatch(p1, c)
+				log.Printf("quick match started")
+			}
 
 		case msg := <-h.inputs:
 			if room, ok := h.rooms[msg.client]; ok {
@@ -98,12 +103,28 @@ func (h *Hub) Run() {
 	}
 }
 
-// cleanup removes a departed client from wherever it was: a pending room, or an
-// active match (in which case the opponent is told and the room is torn down).
+// startMatch pairs two clients into a fresh room and kicks off its goroutine.
+// Used by both code-join and quick-match.
+func (h *Hub) startMatch(p1, p2 *Client) {
+	p1.player, p2.player = 1, 2
+	room := newRoom(p1, p2)
+	h.rooms[p1] = room
+	h.rooms[p2] = room
+	pushJSON(p1, startMsg{T: "start", You: 1})
+	pushJSON(p2, startMsg{T: "start", You: 2})
+	go room.run()
+}
+
+// cleanup removes a departed client from wherever it was: a pending room, the
+// quick-match queue, or an active match (then the opponent is told and the room
+// is torn down).
 func (h *Hub) cleanup(c *Client) {
 	if c.code != "" && h.pending[c.code] == c {
 		delete(h.pending, c.code)
 		log.Printf("pending room %s abandoned", c.code)
+	}
+	if h.quickWaiting == c {
+		h.quickWaiting = nil
 	}
 
 	room, ok := h.rooms[c]

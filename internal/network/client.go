@@ -70,6 +70,8 @@ func (c *Client) readPump() {
 			c.hub.create <- c
 		case "join":
 			c.hub.join <- joinReq{client: c, code: m.Code}
+		case "quick":
+			c.hub.quick <- c
 		case "input":
 			c.hub.inputs <- inputMsg{client: c, dir: m.Dir}
 		case "vote":
